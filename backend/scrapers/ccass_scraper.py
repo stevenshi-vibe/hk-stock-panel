@@ -455,16 +455,13 @@ def _compute_daily_changes(conn, data_date: str):
 
 
 def compute_query_to_data_date(query_date_str: str) -> str:
-    """Convert query date (YYYY/MM/DD) to data date (T-2 working days, YYYY-MM-DD)."""
-    query_dt = datetime.strptime(query_date_str, '%Y/%m/%d')
-    data_dt = query_dt - timedelta(days=1)
-    wd_count = 0
-    while wd_count < 2:
-        if data_dt.weekday() < 5:
-            wd_count += 1
-        if wd_count < 2:
-            data_dt -= timedelta(days=1)
-    return data_dt.strftime('%Y-%m-%d')
+    """Convert query date (YYYY/MM/DD) to data date (YYYY-MM-DD).
+
+    HKEX CCASS returns holdings as at the requested ``txtShareholdingDate``,
+    which is already the latest published session (T+1). The query date is
+    therefore the data date, and must not be shifted.
+    """
+    return datetime.strptime(query_date_str, '%Y/%m/%d').strftime('%Y-%m-%d')
 
 
 def find_latest_query_date() -> str:
