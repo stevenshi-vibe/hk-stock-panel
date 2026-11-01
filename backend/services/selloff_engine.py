@@ -371,6 +371,26 @@ def compute_selloff_range(stock_code: str, days: int = 30):
     return all_results
 
 
+def _summary_without_ccass(att) -> dict:
+    """Show an uploaded attribution even when this stock has no CCASS seat history yet."""
+    baseline = att['shares_baseline'] or 0
+    return {
+        'shareholder_name': att['shareholder_name'],
+        'participant_id': att['participant_id'],
+        'participant_name': att['participant_name'],
+        'shares_baseline': baseline,
+        'shares_current': baseline,
+        'change_from_baseline': 0 if baseline else None,
+        'change_30d': None,
+        'seat_shares_current': None,
+        'cost_hkd': att['cost_hkd'],
+        'investor_type': att['investor_type'],
+        'unlock_date': att['unlock_date'],
+        'confidence': att['confidence'],
+        'notes': att['notes'],
+    }
+
+
 def get_shareholder_summary(stock_code: str) -> list[dict]:
     """
     Get current shareholder summary with cumulative changes.
@@ -382,13 +402,21 @@ def get_shareholder_summary(stock_code: str) -> list[dict]:
     # Get latest date first, then compute outside any open read transaction to avoid SQLite lock.
     with get_stock_conn(code) as conn:
         latest_date_row = conn.execute("SELECT MAX(trade_date) as d FROM ccass_participants").fetchone()
-        if not latest_date_row or not latest_date_row['d']:
-            return []
-        latest_date = latest_date_row['d']
+        latest_date = latest_date_row['d'] if latest_date_row else None
+        if not latest_date:
+            attributions = conn.execute("SELECT * FROM shareholder_attribution").fetchall()
+            return [_summary_without_ccass(a) for a in attributions]
 
     # Make sure selloff is computed for latest date.
     # This function writes shareholder_selloff, so it must not run while another connection is open.
-    compute_shareholder_selloff(code, latest_date)
+    # A failure here must not hide attributions that were just uploaded.
+    try:
+        compute_shareholder_selloff(code, latest_date)
+    except Exception:
+        logger.exception("Selloff compute failed for %s; returning stored attributions", code)
+        with get_stock_conn(code) as conn:
+            attributions = conn.execute("SELECT * FROM shareholder_attribution").fetchall()
+            return [_summary_without_ccass(a) for a in attributions]
 
     with get_stock_conn(code) as conn:
         # Build current seat holdings map

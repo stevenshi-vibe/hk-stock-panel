@@ -31,9 +31,9 @@ export default function StockDashboard({ stockCode, onBack, onStockUpdated, init
   const pollGen = useRef(0)
   const activeJobRef = useRef<string | null>(initialJobId || null)
 
-  const loadDashboard = async () => {
+  const loadDashboard = async (silent = false) => {
     try {
-      setLoading(true)
+      if (!silent) setLoading(true)
       setError('')
       const data = await api.getDashboard(stockCode)
       setDashboard(data)
@@ -43,7 +43,7 @@ export default function StockDashboard({ stockCode, onBack, onStockUpdated, init
     } catch (e: any) {
       setError(e.message || t('loading'))
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }
 
@@ -260,7 +260,7 @@ export default function StockDashboard({ stockCode, onBack, onStockUpdated, init
             {tab === 'trading' && <TradingTab stockCode={code} />}
             {tab === 'signals' && <SignalsTab stockCode={code} />}
             {tab === 'reports' && <ReportsTab stockCode={code} stockName={name} />}
-            {tab === 'ir' && <IrTab stockCode={code} onConfigured={loadDashboard} />}
+            {tab === 'ir' && <IrTab stockCode={code} onConfigured={() => { loadDashboard(true) }} />}
           </>
         )}
       </main>
