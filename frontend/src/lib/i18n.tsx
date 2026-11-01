@@ -218,7 +218,7 @@ const translations = {
 
     // IR tab
     uploadTitle: '📤 上传股东名册/券商账户表',
-    uploadDesc: '支持 Excel(.xlsx)、CSV、PDF 格式。系统将自动识别股东名称、席位号、持股数量、解禁日期等字段。上传后自动建立归因模型，开始追踪老股东减持。',
+    uploadDesc: '支持 Excel（.xlsx）、CSV、PDF。表头放在前 30 行内，需包含股东名称（姓名 / 股東名稱）和持股数量；席位号或参与者编号可选。识别成功后，记录出现在下方「股东归因」表。',
     selectFile: '选择文件上传',
     uploadingParsing: '上传解析中...',
     addManualAttr: '+ 手动添加归因',
@@ -545,7 +545,7 @@ const translations = {
 
     // IR tab
     uploadTitle: '📤 Upload Shareholder Register / Broker Account',
-    uploadDesc: 'Supports Excel (.xlsx), CSV, PDF formats. The system will automatically identify shareholder names, participant IDs, share quantities, unlock dates and other fields. After upload, an attribution model is built and shareholder selloff tracking begins.',
+    uploadDesc: 'Supports Excel (.xlsx), CSV and PDF. Put the header in the first 30 rows, with a shareholder name column (姓名 / 股東名稱) and a shares column. Participant ID is optional. Recognized rows appear in the Shareholder Attribution table below.',
     selectFile: 'Select File to Upload',
     uploadingParsing: 'Uploading & Parsing...',
     addManualAttr: '+ Add Attribution Manually',

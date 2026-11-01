@@ -182,10 +182,12 @@ export default function IrTab({ stockCode, onConfigured }: { stockCode: string; 
       {loading ? (
         <div className="text-center py-8 text-slate-400">{t('loading')}</div>
       ) : !hasAttribution ? (
-        <div className="text-center py-12 text-slate-400">
-          <p className="text-4xl mb-3">🔒</p>
-          <p>{t('noAttribution')}</p>
-        </div>
+        uploadResult?.error ? null : (
+          <div className="text-center py-12 text-slate-400">
+            <p className="text-4xl mb-3">🔒</p>
+            <p>{t('noAttribution')}</p>
+          </div>
+        )
       ) : (
         <>
           {/* Shareholder Summary */}

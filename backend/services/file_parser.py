@@ -1,14 +1,31 @@
 """
 File parser for IR onboarding.
-Supports Excel (.xlsx), CSV, PDF for shareholder/broker mapping uploads.
+Supports Excel (.xlsx), CSV/TSV, PDF for shareholder/broker mapping uploads.
 """
+import csv
+import io
 import os
 import logging
 import json
-from datetime import datetime
+import re
+from datetime import datetime, date
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# CCASS participant IDs are one letter plus five digits (e.g. C00019).
+_CCASS_ID_RE = re.compile(r'^[A-Z]\d{5}$')
+
+# Short aliases must match the whole header. Otherwise「股东」steals「股东编号」
+# and「id」steals「Participant ID」before the more specific column is considered.
+_EXACT_ONLY = {
+    '股东', '股東', '投资者', '投資者', '姓名', '名称', '名稱', 'name',
+    '编号', '編號', '代码', '代碼', 'id',
+    '券商', '席位',
+    '持股', '数量', '數量',
+    '类型', '類型', 'type',
+    '成本', '解禁',
+}
 
 
 def parse_number(val):
@@ -40,45 +57,55 @@ def detect_file_type(filename: str) -> str:
 
 
 def parse_excel(filepath: str) -> list[dict]:
-    """Parse Excel file and return list of row dicts."""
+    """Parse Excel file and return list of row dicts.
+
+    read_only is intentionally off. Some registers (WPS / certain exporters)
+    publish a stale worksheet dimension of A1, and read_only mode then yields
+    only the first cell — the upload looks successful and zero rows load.
+    """
     import openpyxl
-    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+    try:
+        wb = openpyxl.load_workbook(filepath, read_only=False, data_only=True)
+    except Exception as e:
+        msg = str(e).lower()
+        if 'old .xls' in msg or 'does not support' in msg:
+            raise ValueError('不支持旧版 .xls，请另存为 .xlsx 后再上传。Old .xls is not supported; save as .xlsx.') from e
+        raise
     all_rows = []
-    for ws in wb.worksheets:
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            continue
-        # Try to find header row
-        header_idx = _find_header_row(rows)
-        if header_idx is None:
-            continue
-        headers = [str(h).strip() if h else f'col_{i}' for i, h in enumerate(rows[header_idx])]
-        for row in rows[header_idx + 1:]:
-            if not any(c is not None for c in row):
-                continue
-            record = {}
-            for i, h in enumerate(headers):
-                if i < len(row):
-                    record[h] = row[i]
-            all_rows.append(record)
-    wb.close()
+    try:
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            all_rows.extend(_rows_from_grid(rows))
+    finally:
+        wb.close()
     return all_rows
 
 
 def parse_csv(filepath: str) -> list[dict]:
-    """Parse CSV file."""
-    import csv
-    rows = []
-    # Try UTF-8 then GBK
-    for encoding in ['utf-8-sig', 'gbk', 'gb2312', 'utf-8']:
+    """Parse CSV / TSV text. Header may sit below a title block."""
+    text = _read_text(filepath)
+    first = next((ln for ln in text.splitlines() if ln.strip()), '')
+    comma, tab, semi = first.count(','), first.count('\t'), first.count(';')
+    if tab >= comma and tab >= semi and tab > 0:
+        delimiter = '\t'
+    elif semi > comma and semi > 0:
+        delimiter = ';'
+    else:
+        delimiter = ','
+    grid = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    return _rows_from_grid(grid)
+
+
+def _read_text(filepath: str) -> str:
+    last_error = None
+    for encoding in ('utf-8-sig', 'utf-8', 'gb18030', 'gbk', 'big5', 'utf-16'):
         try:
-            with open(filepath, 'r', encoding=encoding) as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-            break
-        except (UnicodeDecodeError, UnicodeError):
+            with open(filepath, 'r', encoding=encoding, newline='') as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError) as e:
+            last_error = e
             continue
-    return [{k.strip(): v for k, v in r.items()} for r in rows]
+    raise ValueError('无法识别文件编码，请另存为 UTF-8 或 GBK。Could not detect encoding; save as UTF-8 or GBK.') from last_error
 
 
 def parse_pdf(filepath: str) -> list[dict]:
@@ -92,61 +119,199 @@ def parse_pdf(filepath: str) -> list[dict]:
                 for table in tables:
                     if not table or len(table) < 2:
                         continue
-                    header_idx = _find_header_row(table)
-                    if header_idx is None:
-                        continue
-                    headers = [str(h).strip() if h else f'col_{i}' for i, h in enumerate(table[header_idx])]
-                    for row in table[header_idx + 1:]:
-                        if not any(c for c in row):
-                            continue
-                        record = {}
-                        for i, h in enumerate(headers):
-                            record[h] = row[i] if i < len(row) else None
-                        all_rows.append(record)
+                    all_rows.extend(_rows_from_grid(table))
     except Exception as e:
         logger.error(f"PDF parse error: {e}")
     return all_rows
 
 
+_HEADER_KEYWORDS = (
+    '股东', '股東', 'shareholder', '姓名', '持有人', 'holder', '客户', '客戶',
+    '账户', '帳戶', '帐户', '投资者', '投資者', 'investor',
+    '券商', '席位', 'participant', 'broker', '经纪', '經紀', '托管', '託管',
+    '持股', '股份', 'shares', 'holding',
+    '解禁', 'unlock', '编号', '編號', '名称', '名稱', 'name',
+)
+
+
 def _find_header_row(rows: list) -> Optional[int]:
-    """Heuristic to find the header row in a table."""
-    keywords = {'股东', 'shareholder', '券商', 'broker', '席位', 'participant', '持股', 'shares',
-                '开户', '银行', '解禁', 'unlock', '名称', 'name', '编号', 'id', '代码', 'code'}
-    for i, row in enumerate(rows[:5]):
+    """Pick the header row.
+
+    Real registers put the company name, a "股东名册" title and an as-of date
+    above the columns. Scanning only the first hit in the first five rows treated
+    that title as the header whenever it contained two keywords, and every data
+    row was then discarded.
+    """
+    best_idx = None
+    best_key = (0, 0)  # (keyword score, number of filled cells)
+    for i, row in enumerate(rows[:40]):
         if not row:
             continue
-        text = ' '.join(str(c).lower() for c in row if c is not None)
-        score = sum(1 for kw in keywords if kw in text)
-        if score >= 2:
-            return i
-    return 0 if rows and any(c for c in rows[0]) else None
+        cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+        # A title merged across the sheet is one cell; real headers have several.
+        if len(cells) < 2:
+            continue
+        text = ' '.join(cells).lower()
+        score = sum(1 for kw in _HEADER_KEYWORDS if kw in text)
+        key = (score, len(cells))
+        if key > best_key:
+            best_key = key
+            best_idx = i
+    if best_idx is not None and best_key[0] >= 2:
+        return best_idx
+    return None
 
 
-# 股东/券商字段映射 - 常见列名到标准字段
+def _rows_from_grid(rows: list) -> list[dict]:
+    if not rows:
+        return []
+    header_idx = _find_header_row(rows)
+    if header_idx is None:
+        return []
+    raw_headers = [str(h).strip() if h else '' for h in rows[header_idx]]
+    counts: dict[str, int] = {}
+    headers = []
+    for i, base in enumerate(raw_headers):
+        name = base or f'col_{i}'
+        seen = counts.get(name, 0)
+        counts[name] = seen + 1
+        headers.append(name if seen == 0 else f'{name}_{seen + 1}')
+    out = []
+    for row in rows[header_idx + 1:]:
+        if not row or not any(c is not None and str(c).strip() for c in row):
+            continue
+        record = {}
+        for i, h in enumerate(headers):
+            if h.startswith('col_') or i >= len(row):
+                continue
+            value = row[i]
+            if value is None or str(value).strip() == '':
+                continue
+            record[h] = value
+        if record:
+            out.append(record)
+    return out
+
+
+# 股东/券商字段映射。简体、繁体和券商账户表的常见列名都要能对上。
 FIELD_ALIASES = {
-    'shareholder_name': ['股东', '股东名称', '股东姓名', '投资者名称', 'shareholder', 'investor', 'name', '名称'],
-    'participant_id': ['席位号', '参与者编号', '券商编号', 'ccass编号', 'participant_id', 'pid', 'broker_id', '编号', '代码', 'id'],
-    'participant_name': ['券商', '席位', '开户银行', '开户行', '托管券商', 'participant', 'broker', 'custodian', '席位名称'],
-    'shares': ['持股数', '持股数量', '持股', '股数', '数量', 'shares', 'holding', '持股量'],
-    'investor_type': ['类型', '股东类型', '投资者类型', 'type', 'category', '股份类型'],
-    'cost_hkd': ['成本', '入股价', '投资成本', '发行价', 'cost', 'price', 'ipo价格'],
-    'unlock_date': ['解禁日', '解禁日期', '解锁日', '锁定期', 'unlock', 'lockup_expiry', '解禁时间'],
+    'shareholder_name': [
+        '股东名称', '股東名稱', '股东姓名', '股東姓名', '股东名', '股東名',
+        '投资者名称', '投資者名稱', '客户姓名', '客戶姓名', '客户名称', '客戶名稱',
+        '持有人名称', '持有人名稱', '持有人', '账户名称', '帳戶名稱', '帐户名称',
+        '登记股东', '登記股東', '受益人', 'shareholdername', 'shareholder',
+        'investorname', 'investor', 'holder', 'beneficiary',
+        '股东', '股東', '投资者', '投資者', '姓名', '名称', '名稱', 'name',
+    ],
+    'participant_id': [
+        '参与者编号', '參與者編號', '参与者代码', '參與者代碼',
+        '券商编号', '券商編號', '券商代码', '券商代碼',
+        'ccass编号', 'ccass編號', 'ccass号码', 'ccass號碼', 'ccassid',
+        '席位号', '席位號', '席位编号', '席位編號',
+        'participantid', 'brokerid', 'pid',
+        '编号', '編號', '代码', '代碼', 'id',
+    ],
+    'participant_name': [
+        '参与者名称', '參與者名稱', '券商名称', '券商名稱',
+        '席位名称', '席位名稱', '开户券商', '開戶券商',
+        '开户银行', '開戶銀行', '开户行', '開戶行',
+        '托管券商', '託管券商', '托管商', '託管商', '托管人', '託管人', '托管银行', '託管銀行',
+        '经纪商', '經紀商', 'participantname', 'brokername', 'custodian',
+        '经纪', '經紀', '券商', '席位', 'participant', 'broker',
+    ],
+    'shares': [
+        '持股数量', '持股數量', '持股数目', '持股數目',
+        '股份数量', '股份數量', '股份数目', '股份數目',
+        '持有股数', '持有股數', '持有数量', '持有數量',
+        '证券数量', '證券數量', '持股数', '持股數', '持股量',
+        '股数', '股數', 'numberofshares', 'sharesheld', 'shareholding',
+        '持股', '数量', '數量', 'shares', 'holding',
+    ],
+    'investor_type': [
+        '投资者类型', '投資者類型', '股东类型', '股東類型', '股份类型', '股份類型',
+        'investortype', 'shareholdertype', '类型', '類型', 'category', 'type',
+    ],
+    'cost_hkd': [
+        '投资成本', '投資成本', '入股价', '入股價', '发行价', '發行價',
+        '成本价', '成本價', 'ipoprice', 'price', 'cost', '成本',
+    ],
+    'unlock_date': [
+        '解禁日期', '解禁时间', '解禁時間', '解锁日', '解鎖日',
+        '锁定期', '鎖定期', 'lockupexpiry', 'lockup',
+        '解禁日', 'unlock', '解禁',
+    ],
 }
 
 
+def _norm_header(value) -> str:
+    text = str(value).strip().lower()
+    return re.sub(r'[\s_\-—/\\()（）\[\]【】:：.,，。·]+', '', text)
+
+
 def map_fields(record: dict) -> dict:
-    """Map column aliases to standard field names."""
-    mapped = {}
+    """Map column aliases to standard field names.
+
+    Each source column is used at most once. The longest / exact alias wins,
+    so「股东编号」不再盖住「股东名称」，"Participant ID" 不再被当成券商名称。
+    """
+    items = []
+    for key, value in record.items():
+        if key is None or value is None or str(value).strip() == '':
+            continue
+        items.append((key, value, _norm_header(key)))
+
+    candidates = []
     for std_field, aliases in FIELD_ALIASES.items():
-        for alias in aliases:
-            for key, value in record.items():
-                key_str = str(key).strip().lower()
-                if alias.lower() in key_str and value is not None and str(value).strip():
-                    mapped[std_field] = value
-                    break
-            if std_field in mapped:
-                break
+        for key, value, key_norm in items:
+            if not key_norm:
+                continue
+            best = 0
+            for alias in aliases:
+                alias_norm = _norm_header(alias)
+                if not alias_norm:
+                    continue
+                exact_only = alias_norm in _EXACT_ONLY or alias in _EXACT_ONLY
+                if key_norm == alias_norm:
+                    best = max(best, 1000 + len(alias_norm))
+                elif not exact_only and alias_norm in key_norm:
+                    best = max(best, len(alias_norm))
+            if best:
+                candidates.append((best, len(key_norm), std_field, key, value))
+
+    candidates.sort(key=lambda item: (-item[0], -item[1]))
+    mapped = {}
+    used_keys = set()
+    for _score, _key_len, std_field, key, value in candidates:
+        if std_field in mapped or key in used_keys:
+            continue
+        mapped[std_field] = value
+        used_keys.add(key)
     return mapped
+
+
+def _clean_participant_id(value) -> str:
+    if value is None:
+        return ''
+    text = str(value).strip().upper().replace(' ', '')
+    if text.endswith('.0') and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def _clean_date(value) -> Optional[str]:
+    if value is None or str(value).strip() == '':
+        return None
+    if isinstance(value, datetime):
+        return value.strftime('%Y-%m-%d')
+    if isinstance(value, date):
+        return value.strftime('%Y-%m-%d')
+    text = str(value).strip()
+    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d', '%d/%m/%Y', '%d-%m-%Y'):
+        try:
+            return datetime.strptime(text[:10], fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return text[:10]
 
 
 def parse_uploaded_file(filepath: str, original_filename: str) -> dict:
@@ -162,33 +327,49 @@ def parse_uploaded_file(filepath: str, original_filename: str) -> dict:
     """
     ftype = detect_file_type(original_filename)
 
-    if ftype == 'excel':
-        raw_rows = parse_excel(filepath)
-    elif ftype == 'csv':
-        raw_rows = parse_csv(filepath)
-    elif ftype == 'pdf':
-        raw_rows = parse_pdf(filepath)
-    else:
-        return {'file_type': ftype, 'error': f'Unsupported file type: {ftype}', 'rows_raw': [], 'attributions': [], 'unlocks': [], 'summary': {}}
+    try:
+        if ftype == 'excel':
+            raw_rows = parse_excel(filepath)
+        elif ftype in ('csv', 'text'):
+            raw_rows = parse_csv(filepath)
+        elif ftype == 'pdf':
+            raw_rows = parse_pdf(filepath)
+        else:
+            return {
+                'file_type': ftype,
+                'error': '不支持的文件类型，请上传 .xlsx、.csv 或 .pdf。Unsupported file type; upload .xlsx, .csv, or .pdf.',
+                'rows_raw': [], 'attributions': [], 'unlocks': [], 'summary': {},
+            }
+    except ValueError as e:
+        return {
+            'file_type': ftype, 'error': str(e),
+            'rows_raw': [], 'attributions': [], 'unlocks': [], 'summary': {},
+        }
 
     attributions = []
     unlocks = []
 
     for row in raw_rows:
         mapped = map_fields(row)
-        if mapped.get('shareholder_name') or mapped.get('participant_name'):
-            # Clean up
-            attr = {
-                'shareholder_name': str(mapped.get('shareholder_name', '')).strip(),
-                'participant_id': str(mapped.get('participant_id', '')).strip().upper() if mapped.get('participant_id') else '',
-                'participant_name': str(mapped.get('participant_name', '')).strip(),
-                'shares_baseline': parse_number(mapped.get('shares')),
-                'investor_type': str(mapped.get('investor_type', '')).strip() if mapped.get('investor_type') else '',
-                'cost_hkd': parse_number(mapped.get('cost_hkd')),
-                'unlock_date': str(mapped.get('unlock_date', '')).strip()[:10] if mapped.get('unlock_date') else None,
-            }
-            if attr['shareholder_name']:
-                attributions.append(attr)
+        if not (mapped.get('shareholder_name') or mapped.get('participant_name') or mapped.get('participant_id')):
+            continue
+        attr = {
+            'shareholder_name': str(mapped.get('shareholder_name', '')).strip(),
+            'participant_id': _clean_participant_id(mapped.get('participant_id')),
+            'participant_name': str(mapped.get('participant_name', '')).strip(),
+            'shares_baseline': parse_number(mapped.get('shares')),
+            'investor_type': str(mapped.get('investor_type', '')).strip() if mapped.get('investor_type') else '',
+            'cost_hkd': parse_number(mapped.get('cost_hkd')),
+            'unlock_date': _clean_date(mapped.get('unlock_date')),
+        }
+        # 列名是「席位」而单元格里其实是 C00019 这类参与者编号。
+        if not attr['participant_id'] and _CCASS_ID_RE.match(attr['participant_name'].replace(' ', '').upper()):
+            attr['participant_id'] = attr['participant_name'].replace(' ', '').upper()
+            attr['participant_name'] = ''
+        if not attr['shareholder_name']:
+            attr['shareholder_name'] = attr['participant_name']
+        if attr['shareholder_name']:
+            attributions.append(attr)
 
             # Check for unlock date
             if attr.get('unlock_date') and attr.get('shares_baseline'):
@@ -210,12 +391,27 @@ def parse_uploaded_file(filepath: str, original_filename: str) -> dict:
     }
 
     logger.info(f"Parsed {original_filename}: {summary}")
+    error = None
+    if not attributions:
+        cols = []
+        for row in raw_rows[:3]:
+            for key in row.keys():
+                label = str(key).strip()
+                if label and not label.startswith('col_') and label not in cols:
+                    cols.append(label)
+        shown = '、'.join(cols[:8]) if cols else '未找到表头'
+        error = (
+            f'未识别到股东记录（读到的列：{shown}）。'
+            '请包含「股东名称」或「姓名」（繁体可用「股東名稱」）以及「持股数量」。'
+            'No shareholder rows recognized; include a name column and a shares column.'
+        )
     return {
         'file_type': ftype,
         'rows_raw': raw_rows,
         'attributions': attributions,
         'unlocks': unlocks,
         'summary': summary,
+        'error': error,
     }
 
 

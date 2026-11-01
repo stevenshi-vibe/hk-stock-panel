@@ -610,14 +610,17 @@ async def upload_file(stock_code: str, file: UploadFile = File(...)):
             except Exception as e:
                 logger.error(f"Selloff recompute failed after upload: {e}")
 
-        return {
-            'status': 'ok',
+        payload = {
+            'status': 'ok' if result.get('attributions') else 'empty',
             'upload_id': upload_id,
             'summary': result.get('summary', {}),
             'attributions': result.get('attributions', []),
             'unlocks': result.get('unlocks', []),
             'preview_rows': result.get('rows_raw', [])[:5],
         }
+        if result.get('error'):
+            payload['error'] = result['error']
+        return payload
     except Exception as e:
         logger.error(f"File parse error: {e}")
         raise HTTPException(500, f"Failed to parse file: {str(e)}")

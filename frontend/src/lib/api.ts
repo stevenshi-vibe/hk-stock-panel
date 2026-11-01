@@ -45,9 +45,10 @@ export const api = {
   uploadFile: (code: string, file: File) => {
     const fd = new FormData()
     fd.append('file', file)
-    return fetch(`${API_BASE}/stock/${code}/upload`, { method: 'POST', body: fd }).then(r => {
-      if (!r.ok) throw new Error('Upload failed')
-      return r.json()
+    return fetch(`${API_BASE}/stock/${code}/upload`, { method: 'POST', body: fd }).then(async r => {
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.detail || data.error || 'Upload failed')
+      return data
     })
   },
 
