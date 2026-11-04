@@ -17,6 +17,7 @@ import threading
 from bs4 import BeautifulSoup
 
 from .anti_ban import make_ccass_client
+from services.hkex_calendar import is_shareholding_query_day, previous_settlement_day
 
 logger = logging.getLogger(__name__)
 
@@ -222,16 +223,18 @@ def fetch_ccass_participants(stock_code: str, query_date: str) -> tuple[str, lis
 
     soup = BeautifulSoup(r.text, 'html.parser')
 
-    # Verify date
+    # HKEX rewrites a Sunday or public-holiday shareholding date to the previous
+    # book. Keep that response only when it is exactly the date we asked for,
+    # so a holiday query cannot be stored under the next session's label.
     date_input = soup.find('input', {'id': 'txtShareholdingDate'})
     shown_date = date_input.get('value', '') if date_input else ''
-    if shown_date != query_date:
-        return data_date, [], None
-
-    # Verify stock code
     code_input = soup.find('input', {'id': 'txtStockCode'})
     shown_code = code_input.get('value', '') if code_input else ''
-    if shown_code != code:
+    if not shareholding_page_matches(query_date, shown_date, code, shown_code):
+        logger.info(
+            'Skipping CCASS response for %s %s; page shows %s %s',
+            code, query_date, shown_code, shown_date,
+        )
         return data_date, [], None
 
     ccass_total = _parse_ccass_summary(soup)
@@ -454,26 +457,39 @@ def _compute_daily_changes(conn, data_date: str):
         """, (data_date, pid, p['participant_name'], cur_shares, change_1d, change_3d, change_5d))
 
 
+def shareholding_page_matches(query_date: str, shown_date: str, query_code: str, shown_code: str) -> bool:
+    """True when the CCASS page is the shareholding date and stock that were requested."""
+    return (shown_date or '') == query_date and (shown_code or '') == query_code
+
+
 def compute_query_to_data_date(query_date_str: str) -> str:
-    """Convert query date (YYYY/MM/DD) to data date (T-2 working days, YYYY-MM-DD)."""
+    """Map a shareholding date (YYYY/MM/DD) to the trade date it settles (YYYY-MM-DD).
+
+    Exchange trades settle on the second settlement day after the trade. The
+    book published for shareholding date S is therefore stored under the
+    trade date two settlement days earlier. Weekends, full closures, and
+    half-day non-settlement sessions are not counted.
+    """
     query_dt = datetime.strptime(query_date_str, '%Y/%m/%d')
-    data_dt = query_dt - timedelta(days=1)
-    wd_count = 0
-    while wd_count < 2:
-        if data_dt.weekday() < 5:
-            wd_count += 1
-        if wd_count < 2:
-            data_dt -= timedelta(days=1)
-    return data_dt.strftime('%Y-%m-%d')
+    trade_date = previous_settlement_day(query_dt.date(), 2)
+    return trade_date.strftime('%Y-%m-%d')
 
 
-def find_latest_query_date() -> str:
-    """Find the latest available HKEX disclosure date."""
-    now = datetime.utcnow() + timedelta(hours=8)  # HKT
-    qd = now - timedelta(days=1)
-    while qd.weekday() >= 5:
+def find_latest_query_date(now: datetime | None = None) -> str:
+    """Latest HKEX shareholding date that is not rewritten to an earlier book.
+
+    ``now`` is Hong Kong time. The default is the current HKT clock. Full
+    closures and half-day non-settlement sessions are skipped.
+    """
+    if now is None:
+        now = datetime.utcnow() + timedelta(hours=8)  # HKT
+    qd = now.date() - timedelta(days=1)
+    fallback = qd
+    for _ in range(30):
+        if is_shareholding_query_day(qd):
+            return qd.strftime('%Y/%m/%d')
         qd -= timedelta(days=1)
-    return qd.strftime('%Y/%m/%d')
+    return fallback.strftime('%Y/%m/%d')
 
 
 def _participant_ids_before(conn, data_date: str) -> set:
@@ -529,7 +545,7 @@ def backfill_stock(stock_code: str, start_date: str = None, days: int = 90, dela
         tasks = []
         cur = start
         while cur <= end:
-            if cur.weekday() < 5:
+            if is_shareholding_query_day(cur.date()):
                 date_str = cur.strftime('%Y/%m/%d')
                 data_date = compute_query_to_data_date(date_str)
                 if data_date not in existing:

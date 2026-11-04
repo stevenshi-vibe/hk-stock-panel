@@ -10,6 +10,8 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+from services.hkex_calendar import is_shareholding_query_day, is_settlement_day, settlement_days_between
+
 # Trading-session choices shown in the CCASS tab. 365 is the ceiling.
 CCASS_RANGE_OPTIONS = (30, 60, 90, 180, 365)
 CCASS_RANGE_DEFAULT = 60
@@ -23,15 +25,24 @@ _guard = threading.Lock()
 _runs: dict[str, dict] = {}
 
 
-def calendar_lookback_days(trading_days: int) -> int:
-    """Calendar span that should cover `trading_days` sessions, never past 12 months.
+def calendar_lookback_days(trading_days: int, end: datetime | None = None) -> int:
+    """Calendar span covering `trading_days` settlement sessions, never past 12 months.
 
-    The historical backfill used `days * 1.6` to turn a trading-day count into
-    calendar days (weekends). That expansion is kept, then capped so a 365-day
-    request does not walk ~584 calendar days of dates HKEX will not return.
+    Weekends, full-day closures, and half-day non-settlement sessions are not
+    counted. The walk is capped so a long request does not pass the 12-month
+    window HKEX will not return.
     """
     trading_days = max(1, int(trading_days))
-    return min(HKEX_CCASS_MAX_CALENDAR_DAYS, int(trading_days * 1.6))
+    end_day = (end or datetime.utcnow()).date()
+    remaining = trading_days
+    cursor = end_day
+    while remaining > 0 and (end_day - cursor).days < HKEX_CCASS_MAX_CALENDAR_DAYS:
+        if is_settlement_day(cursor):
+            remaining -= 1
+            if remaining == 0:
+                break
+        cursor -= timedelta(days=1)
+    return min(HKEX_CCASS_MAX_CALENDAR_DAYS, (end_day - cursor).days)
 
 
 def chunked(items, size: int):
@@ -41,12 +52,13 @@ def chunked(items, size: int):
 
 
 def plan_backfill_query_dates(existing_data_dates, end_query: datetime, trading_days: int, to_data_date) -> list[str]:
-    """Weekday query dates (YYYY/MM/DD) inside the capped window, skipping stored sessions.
+    """Shareholding query dates (YYYY/MM/DD) inside the capped window.
 
-    `to_data_date` maps a query date to the CCASS trade date stored in the DB
-    (HKEX publishes on a T-2 working-day lag).
+    Closures and half-day non-settlement sessions are not requested. HKEX
+    rewrites those dates to an earlier book. `to_data_date` maps a query date
+    to the trade date stored in the DB (two settlement days earlier).
     """
-    lookback = calendar_lookback_days(trading_days)
+    lookback = calendar_lookback_days(trading_days, end_query)
     floor = end_query - timedelta(days=HKEX_CCASS_MAX_CALENDAR_DAYS)
     start = end_query - timedelta(days=lookback)
     if start < floor:
@@ -56,7 +68,7 @@ def plan_backfill_query_dates(existing_data_dates, end_query: datetime, trading_
     cur = start
     existing = set(existing_data_dates or ())
     while cur <= end_query:
-        if cur.weekday() < 5:
+        if is_shareholding_query_day(cur.date()):
             query_date = cur.strftime('%Y/%m/%d')
             if to_data_date(query_date) not in existing:
                 planned.append(query_date)
@@ -65,13 +77,13 @@ def plan_backfill_query_dates(existing_data_dates, end_query: datetime, trading_
 
 
 def assess_ccass_coverage(trade_dates, requested_days: int, today: datetime | None = None) -> dict:
-    """Decide whether the DB already spans the requested trading-day window.
+    """Decide whether the DB already spans the requested settlement-day window.
 
-    Sufficient when any of these is true:
-    - at least `requested_days` sessions are stored
-    - the earliest session already reaches the calendar span of that window
-      (holiday gaps inside a finished walk are not treated as a reason to scrape again)
-    - the earliest session reaches the 12-month HKEX floor, so older rows do not exist
+    Sufficient only when every settlement day in that window is stored. A gap
+    left by a public holiday or a half-day non-settlement session is missing
+    data, not a finished backfill. Reaching the 12-month HKEX floor still
+    counts as complete when the sessions inside that floor are all present,
+    because older books are not published.
     """
     requested = max(1, min(HKEX_CCASS_MAX_CALENDAR_DAYS, int(requested_days)))
     dates = sorted({d for d in (trade_dates or []) if d})
@@ -85,28 +97,30 @@ def assess_ccass_coverage(trade_dates, requested_days: int, today: datetime | No
     else:
         ref = datetime.utcnow()
 
-    lookback = calendar_lookback_days(requested)
-    needed = ref - timedelta(days=lookback)
+    lookback = calendar_lookback_days(requested, ref)
     hkex_floor = ref - timedelta(days=HKEX_CCASS_MAX_CALENDAR_DAYS)
-    # Weekend alignment can leave the first stored session a couple of days
-    # inside the nominal start. Don't treat that as a missing year of history.
+    window_start = ref - timedelta(days=lookback)
+    if window_start < hkex_floor:
+        window_start = hkex_floor
+    expected = settlement_days_between(window_start.date(), ref.date())
+    stored = set(dates)
+    missing = [day.isoformat() for day in expected if day.isoformat() not in stored]
+
+    # The first settlement day can sit a few days inside the calendar floor
+    # when that boundary is a weekend or a closure.
     slack = timedelta(days=4)
+    reaches_hkex_floor = False
+    if earliest:
+        reaches_hkex_floor = datetime.strptime(earliest, '%Y-%m-%d') <= hkex_floor + slack
 
-    def _on_or_before(stored: str | None, boundary: datetime) -> bool:
-        if not stored:
-            return False
-        return datetime.strptime(stored, '%Y-%m-%d') <= boundary + slack
-
-    spans_request = _on_or_before(earliest, needed)
-    reaches_hkex_floor = _on_or_before(earliest, hkex_floor)
-    sufficient = available >= requested or spans_request or reaches_hkex_floor
+    sufficient = bool(dates) and not missing
     return {
         'requested_days': requested,
         'available_days': available,
         'earliest': earliest,
         'latest': latest,
-        'sufficient': bool(sufficient),
-        'hkex_capped': bool(reaches_hkex_floor and available < requested),
+        'sufficient': sufficient,
+        'hkex_capped': bool(reaches_hkex_floor and available < requested and not missing),
     }
 
 

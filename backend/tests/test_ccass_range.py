@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -28,6 +28,7 @@ from services.ccass_range import (  # noqa: E402
     shared_ccass_progress,
 )
 from scrapers.ccass_scraper import compute_query_to_data_date  # noqa: E402
+from services.hkex_calendar import is_settlement_day, settlement_days_between  # noqa: E402
 
 
 def _weekdays_ending(n: int, end: datetime) -> list[str]:
@@ -40,16 +41,31 @@ def _weekdays_ending(n: int, end: datetime) -> list[str]:
     return out
 
 
+def _settlement_days_ending(n: int, end: datetime) -> list[str]:
+    found = []
+    cursor = end.date()
+    while len(found) < n:
+        if is_settlement_day(cursor):
+            found.append(cursor.isoformat())
+        cursor -= timedelta(days=1)
+    return found
+
+
 class CcassRangeMathTests(unittest.TestCase):
     def test_options_and_default(self):
         self.assertEqual(CCASS_RANGE_OPTIONS, (30, 60, 90, 180, 365))
         self.assertEqual(CCASS_RANGE_DEFAULT, 60)
 
-    def test_lookback_keeps_short_windows_and_caps_a_year(self):
-        self.assertEqual(calendar_lookback_days(90), int(90 * 1.6))
-        self.assertEqual(calendar_lookback_days(180), int(180 * 1.6))
-        self.assertEqual(calendar_lookback_days(365), 365)
-        self.assertEqual(calendar_lookback_days(1000), 365)
+    def test_lookback_counts_settlement_sessions_and_caps_a_year(self):
+        end = datetime(2026, 10, 23)
+        span = calendar_lookback_days(90, end)
+        sessions = settlement_days_between((end - timedelta(days=span)).date(), end.date())
+        self.assertEqual(len(sessions), 90)
+        self.assertNotIn(date(2026, 10, 1), sessions)
+        self.assertNotIn(date(2026, 10, 19), sessions)
+        self.assertNotIn(date(2026, 2, 16), sessions)
+        self.assertEqual(calendar_lookback_days(365, end), 365)
+        self.assertEqual(calendar_lookback_days(1000, end), 365)
 
     def test_ensure_progress_does_not_truncate_the_first_steps_to_zero(self):
         self.assertEqual(ccass_ensure_progress_pct(0, 260), 0)
@@ -61,7 +77,7 @@ class CcassRangeMathTests(unittest.TestCase):
 
     def test_coverage_matches_the_ui_windows(self):
         end = datetime(2026, 10, 23)
-        stored_90 = _weekdays_ending(90, end)
+        stored_90 = _settlement_days_ending(90, end)
         self.assertTrue(assess_ccass_coverage(stored_90, 30)['sufficient'])
         self.assertTrue(assess_ccass_coverage(stored_90, 60)['sufficient'])
         self.assertTrue(assess_ccass_coverage(stored_90, 90)['sufficient'])
@@ -72,15 +88,23 @@ class CcassRangeMathTests(unittest.TestCase):
         self.assertFalse(year['sufficient'])
         self.assertFalse(year['hkex_capped'])
 
-    def test_twelve_month_floor_is_enough_even_without_365_sessions(self):
+    def test_twelve_month_floor_is_enough_when_the_sessions_inside_it_are_complete(self):
         latest = datetime(2026, 10, 23)
-        earliest = latest - timedelta(days=365)
-        coverage = assess_ccass_coverage(
-            [earliest.strftime('%Y-%m-%d'), latest.strftime('%Y-%m-%d')],
-            365,
-        )
+        start = latest - timedelta(days=365)
+        sessions = [day.isoformat() for day in settlement_days_between(start.date(), latest.date())]
+        coverage = assess_ccass_coverage(sessions, 365)
         self.assertTrue(coverage['sufficient'])
         self.assertTrue(coverage['hkex_capped'])
+        self.assertLess(coverage['available_days'], 365)
+
+    def test_a_missing_settlement_day_is_not_treated_as_complete(self):
+        latest = datetime(2026, 10, 23)
+        start = latest - timedelta(days=365)
+        sessions = [day.isoformat() for day in settlement_days_between(start.date(), latest.date())]
+        sessions.remove('2026-10-15')
+        coverage = assess_ccass_coverage(sessions, 365)
+        self.assertFalse(coverage['sufficient'])
+        self.assertFalse(coverage['hkex_capped'])
 
     def test_empty_history_is_not_sufficient(self):
         coverage = assess_ccass_coverage([], 60, today=datetime(2026, 10, 23))
@@ -93,15 +117,20 @@ class CcassRangeMathTests(unittest.TestCase):
         year = plan_backfill_query_dates(set(), end, 365, compute_query_to_data_date)
         first = datetime.strptime(year[0], '%Y/%m/%d')
         self.assertLessEqual((end - first).days, 365)
-        self.assertGreaterEqual((end - first).days, 362)
-        # Uncapped 365 * 1.6 calendar days would be ~400 weekday queries.
-        self.assertLess(len(year), 280)
-        self.assertGreater(len(year), 240)
+        self.assertGreaterEqual((end - first).days, 360)
+        self.assertNotIn('2026/10/01', year)
+        self.assertNotIn('2026/10/19', year)
+        self.assertNotIn('2026/02/16', year)
+        self.assertIn('2026/10/15', year)
+        self.assertIn('2026/10/21', year)
+        # A full year of settlement sessions, not every weekday.
+        self.assertLess(len(year), 260)
+        self.assertGreater(len(year), 220)
 
         quarter = plan_backfill_query_dates(set(), end, 90, compute_query_to_data_date)
+        self.assertEqual(len(quarter), 90)
         quarter_first = datetime.strptime(quarter[0], '%Y/%m/%d')
-        self.assertGreaterEqual((end - quarter_first).days, 140)
-        self.assertLessEqual((end - quarter_first).days, 144)
+        self.assertLess((end - quarter_first).days, 365)
 
         sample = year[10]
         skipped = plan_backfill_query_dates(
