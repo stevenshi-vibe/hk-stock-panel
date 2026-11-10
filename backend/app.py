@@ -481,43 +481,68 @@ def ensure_ccass_range(stock_code: str, days: int = Query(60, ge=1, le=365)):
 
 # ============ IR: Shareholder Attribution ============
 
+def _attribution_totals(rows: list[dict]) -> dict:
+    issued = next((row.get('issued_shares') for row in rows if row.get('issued_shares')), None)
+    current = sum(row.get('shares_current') or 0 for row in rows)
+    return {
+        'count': len(rows),
+        'shares_baseline': sum(row.get('shares_baseline') or 0 for row in rows),
+        'shares_current': current,
+        'holding_pct': round(current / issued * 100, 4) if issued else None,
+    }
+
+
+def _run_attribution(fn, *args, **kwargs):
+    from services.shareholder_store import AttributionError
+    try:
+        return fn(*args, **kwargs)
+    except AttributionError as exc:
+        raise HTTPException(exc.status, exc.message)
+
+
 @app.get("/api/stock/{stock_code}/attribution")
 def get_attributions(stock_code: str):
-    """Get shareholder-seat attributions."""
+    """Get shareholder-seat attributions, with percentages and totals recomputed."""
     code = stock_code.zfill(5)
     from services.selloff_engine import get_shareholder_summary
-    return {'shareholders': get_shareholder_summary(code)}
+    rows = get_shareholder_summary(code)
+    issued = next((row.get('issued_shares') for row in rows if row.get('issued_shares')), None)
+    return {
+        'shareholders': rows,
+        'issued_shares': issued,
+        'totals': _attribution_totals(rows),
+    }
 
 
 @app.post("/api/stock/{stock_code}/attribution")
 def add_attribution(stock_code: str, data: dict):
-    """Manually add/edit a shareholder attribution."""
+    """Add one shareholder row. An existing name + seat returns 409; edit it instead."""
     code = stock_code.zfill(5)
-    with get_stock_conn(code) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO shareholder_attribution
-            (shareholder_name, participant_id, participant_name, shares_baseline,
-             investor_type, cost_hkd, unlock_date, attribution_type, confidence, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', 'high', ?)
-        """, (
-            data.get('shareholder_name', ''),
-            data.get('participant_id', '').upper(),
-            data.get('participant_name', ''),
-            data.get('shares_baseline', 0),
-            data.get('investor_type', ''),
-            data.get('cost_hkd'),
-            data.get('unlock_date'),
-            data.get('notes', ''),
-        ))
-    return {'status': 'ok'}
+    from services.shareholder_store import create_attribution
+    return _run_attribution(create_attribution, code, data)
+
+
+@app.put("/api/stock/{stock_code}/attribution/{att_id}")
+def replace_attribution(stock_code: str, att_id: int, data: dict):
+    """Replace the editable fields of one shareholder row and recompute derived values."""
+    code = stock_code.zfill(5)
+    from services.shareholder_store import update_attribution
+    return _run_attribution(update_attribution, code, att_id, data, partial=False)
+
+
+@app.patch("/api/stock/{stock_code}/attribution/{att_id}")
+def patch_attribution(stock_code: str, att_id: int, data: dict):
+    """Update the fields present in the body and recompute derived values."""
+    code = stock_code.zfill(5)
+    from services.shareholder_store import update_attribution
+    return _run_attribution(update_attribution, code, att_id, data, partial=True)
 
 
 @app.delete("/api/stock/{stock_code}/attribution/{att_id}")
 def delete_attribution(stock_code: str, att_id: int):
     code = stock_code.zfill(5)
-    with get_stock_conn(code) as conn:
-        conn.execute("DELETE FROM shareholder_attribution WHERE id = ?", (att_id,))
-    return {'status': 'ok'}
+    from services.shareholder_store import delete_attribution as remove_attribution
+    return _run_attribution(remove_attribution, code, att_id)
 
 
 # ============ IR: Selloff Tracking ============
@@ -562,7 +587,11 @@ def get_unlocks(stock_code: str):
 # ============ IR: File Upload ============
 
 @app.post("/api/stock/{stock_code}/upload")
-async def upload_file(stock_code: str, file: UploadFile = File(...)):
+async def upload_file(
+    stock_code: str,
+    file: UploadFile = File(...),
+    overwrite: bool = Query(False),
+):
     """Upload a shareholder/broker mapping file and parse it."""
     code = stock_code.zfill(5)
     ensure_stock(code)
@@ -597,9 +626,14 @@ async def upload_file(stock_code: str, file: UploadFile = File(...)):
                   f"Saved as {safe_name}"))
             upload_id = cursor.lastrowid
 
-        # Auto-apply attributions
+        # Auto-apply attributions. Rows edited in the panel are kept unless
+        # the caller passes overwrite=true (notes are still preserved).
+        import_report = {'applied': [], 'skipped': [], 'applied_count': 0, 'skipped_count': 0}
         if result.get('attributions'):
-            apply_attributions(code, result['attributions'], result.get('unlocks', []))
+            import_report = apply_attributions(
+                code, result['attributions'], result.get('unlocks', []),
+                overwrite_manual=overwrite,
+            )
             # Mark IR as configured
             with get_meta_conn() as conn:
                 conn.execute("UPDATE stocks SET is_ir_configured = 1 WHERE stock_code = ?", (code,))
@@ -617,7 +651,14 @@ async def upload_file(stock_code: str, file: UploadFile = File(...)):
             'attributions': result.get('attributions', []),
             'unlocks': result.get('unlocks', []),
             'preview_rows': result.get('rows_raw', [])[:5],
+            'skipped_manual': import_report['skipped'],
+            'applied_count': import_report['applied_count'],
         }
+        if import_report['skipped']:
+            payload['import_warning'] = (
+                f"有 {import_report['skipped_count']} 条记录已在面板中手工修改，这次导入没有覆盖。"
+                "确认后可用文件中的持股、成本和解禁日覆盖；备注会保留。"
+            )
         if result.get('error'):
             payload['error'] = result['error']
         return payload

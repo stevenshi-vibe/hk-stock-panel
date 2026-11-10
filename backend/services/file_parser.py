@@ -415,40 +415,141 @@ def parse_uploaded_file(filepath: str, original_filename: str) -> dict:
     }
 
 
-def apply_attributions(stock_code: str, attributions: list[dict], unlocks: list[dict]):
-    """Save parsed attributions and unlock data to stock DB."""
-    from db import get_stock_conn
-    code = stock_code.zfill(5)
-    with get_stock_conn(code) as conn:
-        for a in attributions:
-            conn.execute("""
-                INSERT OR REPLACE INTO shareholder_attribution
-                (shareholder_name, participant_id, participant_name, shares_baseline,
-                 investor_type, cost_hkd, unlock_date, attribution_type, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'upload', 'high')
-            """, (
-                a.get('shareholder_name', ''),
-                a.get('participant_id', ''),
-                a.get('participant_name', ''),
-                a.get('shares_baseline', 0),
-                a.get('investor_type', ''),
-                a.get('cost_hkd'),
-                a.get('unlock_date'),
-            ))
+def _is_protected(row) -> bool:
+    """A row the user typed or later edited must not be replaced by a new file."""
+    if row is None:
+        return False
+    keys = row.keys()
+    edited = int(row['manually_edited'] or 0) if 'manually_edited' in keys else 0
+    origin = (row['attribution_type'] or '') if 'attribution_type' in keys else ''
+    return bool(edited) or origin == 'manual'
 
-        for u in unlocks:
-            conn.execute("""
-                INSERT OR REPLACE INTO unlock_calendar
-                (unlock_date, shareholder_name, shares, cost_hkd, broker, investor_type, unlock_status)
+
+def _as_shares(value) -> int:
+    if value is None or value == '':
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if number < 0:
+        return 0
+    return int(number)
+
+
+def apply_attributions(
+    stock_code: str,
+    attributions: list[dict],
+    unlocks: list[dict],
+    overwrite_manual: bool = False,
+) -> dict:
+    """Save parsed attributions.
+
+    File columns (name, seat, shares, type, cost, unlock date) update an
+    existing upload row in place, so notes and selloff rules stay put.
+    Rows the user edited in the panel are left unchanged unless
+    overwrite_manual is set. Even then, notes are kept — the file has no
+    notes column. Returns the rows applied and the rows skipped.
+    """
+    from db import get_stock_conn
+    from services.shareholder_store import lookup_issued_shares
+
+    code = stock_code.zfill(5)
+    issued = lookup_issued_shares(code)
+    applied = []
+    skipped = []
+    with get_stock_conn(code) as conn:
+        for raw in attributions:
+            name = str(raw.get('shareholder_name') or '').strip()
+            pid = str(raw.get('participant_id') or '').strip().upper()
+            if not name:
+                continue
+            existing = conn.execute(
+                "SELECT * FROM shareholder_attribution WHERE shareholder_name = ? AND participant_id = ?",
+                (name, pid),
+            ).fetchone()
+            if _is_protected(existing) and not overwrite_manual:
+                skipped.append({
+                    'id': existing['id'],
+                    'shareholder_name': name,
+                    'participant_id': pid,
+                    'reason': 'manually_edited',
+                })
+                continue
+            shares = _as_shares(raw.get('shares_baseline'))
+            pct = round(shares / issued * 100.0, 4) if issued and shares else None
+            values = (
+                raw.get('participant_name') or '',
+                shares,
+                pct,
+                raw.get('investor_type') or '',
+                raw.get('cost_hkd'),
+                raw.get('unlock_date'),
+            )
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE shareholder_attribution SET
+                        participant_name = ?, shares_baseline = ?, holding_pct = ?,
+                        investor_type = ?, cost_hkd = ?, unlock_date = ?,
+                        attribution_type = 'upload', manually_edited = 0,
+                        updated_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (*values, existing['id']),
+                )
+                applied.append({
+                    'id': existing['id'], 'action': 'updated',
+                    'shareholder_name': name, 'participant_id': pid,
+                })
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO shareholder_attribution
+                        (shareholder_name, participant_id, participant_name, shares_baseline,
+                         holding_pct, investor_type, cost_hkd, unlock_date,
+                         attribution_type, confidence, manually_edited, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'upload', 'high', 0, datetime('now'))
+                    """,
+                    (name, pid, *values),
+                )
+                applied.append({
+                    'id': cursor.lastrowid, 'action': 'inserted',
+                    'shareholder_name': name, 'participant_id': pid,
+                })
+
+        skipped_names = {row['shareholder_name'] for row in skipped}
+        applied_names = {row['shareholder_name'] for row in applied}
+        for item in unlocks:
+            holder = item.get('shareholder_name', '')
+            if holder in skipped_names and holder not in applied_names:
+                continue
+            conn.execute(
+                """
+                INSERT INTO unlock_calendar
+                    (unlock_date, shareholder_name, shares, cost_hkd, broker, investor_type, unlock_status)
                 VALUES (?, ?, ?, ?, ?, ?, 'upcoming')
-            """, (
-                u.get('unlock_date'),
-                u.get('shareholder_name', ''),
-                u.get('shares', 0),
-                u.get('cost_hkd'),
-                u.get('broker', ''),
-                u.get('investor_type', ''),
-            ))
+                ON CONFLICT(unlock_date, shareholder_name) DO UPDATE SET
+                    shares = excluded.shares,
+                    cost_hkd = excluded.cost_hkd,
+                    broker = excluded.broker,
+                    investor_type = excluded.investor_type
+                """,
+                (
+                    item.get('unlock_date'),
+                    holder,
+                    item.get('shares', 0),
+                    item.get('cost_hkd'),
+                    item.get('broker', ''),
+                    item.get('investor_type', ''),
+                ),
+            )
+    return {
+        'applied': applied,
+        'skipped': skipped,
+        'applied_count': len(applied),
+        'skipped_count': len(skipped),
+    }
 
 
 if __name__ == '__main__':

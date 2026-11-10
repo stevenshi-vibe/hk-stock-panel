@@ -39,13 +39,20 @@ export const api = {
   getAttribution: (code: string) => fetchApi(`/stock/${code}/attribution`),
   addAttribution: (code: string, data: any) =>
     fetchApi(`/stock/${code}/attribution`, { method: 'POST', body: JSON.stringify(data) }),
+  updateAttribution: (code: string, id: number, data: any) =>
+    fetchApi(`/stock/${code}/attribution/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  patchAttribution: (code: string, id: number, data: any) =>
+    fetchApi(`/stock/${code}/attribution/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteAttribution: (code: string, id: number) =>
+    fetchApi(`/stock/${code}/attribution/${id}`, { method: 'DELETE' }),
   getSelloff: (code: string, days = 30) => fetchApi(`/stock/${code}/selloff?days=${days}`),
   getUnlocks: (code: string) => fetchApi(`/stock/${code}/unlocks`),
 
-  uploadFile: (code: string, file: File) => {
+  uploadFile: (code: string, file: File, overwrite = false) => {
     const fd = new FormData()
     fd.append('file', file)
-    return fetch(`${API_BASE}/stock/${code}/upload`, { method: 'POST', body: fd }).then(async r => {
+    const query = overwrite ? '?overwrite=true' : ''
+    return fetch(`${API_BASE}/stock/${code}/upload${query}`, { method: 'POST', body: fd }).then(async r => {
       const data = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(data.detail || data.error || 'Upload failed')
       return data
