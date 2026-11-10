@@ -371,10 +371,32 @@ def compute_selloff_range(stock_code: str, days: int = 30):
     return all_results
 
 
-def _summary_without_ccass(att) -> dict:
+def _col(att, name, default=None):
+    return att[name] if name in att.keys() else default
+
+
+def _share_fields(att, issued: int, shares_current) -> dict:
+    """Identity columns plus percentages derived from the current issued base."""
+    stored = _col(att, 'holding_pct')
+    baseline = att['shares_baseline'] or 0
+    current_pct = round((shares_current or 0) / issued * 100, 4) if issued and shares_current else None
+    baseline_pct = round(baseline / issued * 100, 4) if issued and baseline else None
+    return {
+        'id': att['id'],
+        'holding_pct': current_pct if current_pct is not None else stored,
+        'baseline_pct': baseline_pct if baseline_pct is not None else stored,
+        'stored_holding_pct': stored,
+        'issued_shares': issued or None,
+        'manually_edited': int(_col(att, 'manually_edited', 0) or 0),
+        'attribution_type': att['attribution_type'],
+        'notes': att['notes'],
+    }
+
+
+def _summary_without_ccass(att, issued: int = 0) -> dict:
     """Show an uploaded attribution even when this stock has no CCASS seat history yet."""
     baseline = att['shares_baseline'] or 0
-    return {
+    row = {
         'shareholder_name': att['shareholder_name'],
         'participant_id': att['participant_id'],
         'participant_name': att['participant_name'],
@@ -389,6 +411,8 @@ def _summary_without_ccass(att) -> dict:
         'confidence': att['confidence'],
         'notes': att['notes'],
     }
+    row.update(_share_fields(att, issued, baseline))
+    return row
 
 
 def get_shareholder_summary(stock_code: str) -> list[dict]:
@@ -399,13 +423,16 @@ def get_shareholder_summary(stock_code: str) -> list[dict]:
     from db import get_stock_conn
     code = stock_code.zfill(5)
 
+    from services.shareholder_store import lookup_issued_shares
+    issued = lookup_issued_shares(code)
+
     # Get latest date first, then compute outside any open read transaction to avoid SQLite lock.
     with get_stock_conn(code) as conn:
         latest_date_row = conn.execute("SELECT MAX(trade_date) as d FROM ccass_participants").fetchone()
         latest_date = latest_date_row['d'] if latest_date_row else None
         if not latest_date:
             attributions = conn.execute("SELECT * FROM shareholder_attribution").fetchall()
-            return [_summary_without_ccass(a) for a in attributions]
+            return [_summary_without_ccass(a, issued) for a in attributions]
 
     # Make sure selloff is computed for latest date.
     # This function writes shareholder_selloff, so it must not run while another connection is open.
@@ -416,7 +443,7 @@ def get_shareholder_summary(stock_code: str) -> list[dict]:
         logger.exception("Selloff compute failed for %s; returning stored attributions", code)
         with get_stock_conn(code) as conn:
             attributions = conn.execute("SELECT * FROM shareholder_attribution").fetchall()
-            return [_summary_without_ccass(a) for a in attributions]
+            return [_summary_without_ccass(a, issued) for a in attributions]
 
     with get_stock_conn(code) as conn:
         # Build current seat holdings map
@@ -461,7 +488,7 @@ def get_shareholder_summary(stock_code: str) -> list[dict]:
             baseline = sf.get('shares_baseline', att['shares_baseline'] or 0)
             change_from_baseline = shares_current - baseline if baseline else None
 
-            results.append({
+            row = {
                 'shareholder_name': sh_name,
                 'participant_id': pid,
                 'participant_name': cur['name'] or att['participant_name'],
@@ -475,7 +502,9 @@ def get_shareholder_summary(stock_code: str) -> list[dict]:
                 'unlock_date': att['unlock_date'],
                 'confidence': att['confidence'],
                 'notes': att['notes'],
-            })
+            }
+            row.update(_share_fields(att, issued, shares_current))
+            results.append(row)
 
         return results
 

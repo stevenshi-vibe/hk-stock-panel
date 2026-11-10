@@ -63,6 +63,9 @@ def _migrate_stock_db(conn):
                 ('rule', "TEXT DEFAULT 'all_flow'"),
                 ('static_shares', 'INTEGER DEFAULT 0'),
                 ('peer_shareholders', 'TEXT'),
+                ('holding_pct', 'REAL'),
+                ('manually_edited', 'INTEGER DEFAULT 0'),
+                ('updated_at', 'TEXT'),
             ]
             for col, ddl in migrations:
                 if col not in cols:
@@ -281,6 +284,9 @@ def init_stock_db(stock_code: str):
                 rule TEXT DEFAULT 'all_flow',
                 static_shares INTEGER DEFAULT 0,
                 peer_shareholders TEXT,
+                holding_pct REAL,
+                manually_edited INTEGER DEFAULT 0,
+                updated_at TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 UNIQUE(shareholder_name, participant_id)
             );
