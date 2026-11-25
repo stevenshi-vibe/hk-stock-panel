@@ -35,6 +35,15 @@ export const api = {
   getCapitalFlow: (code: string, days = 5, endDate?: string) =>
     fetchApi(`/stock/${code}/capital-flow?days=${days}${endDate ? `&end_date=${encodeURIComponent(endDate)}` : ''}`),
   getHkConnect: (code: string, days = 60) => fetchApi(`/stock/${code}/hk-connect?days=${days}`),
+  getSouthbound: (code: string, start?: string, end?: string) => {
+    const q = new URLSearchParams()
+    if (start) q.set('start', start)
+    if (end) q.set('end', end)
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return fetchApi(`/stock/${code}/southbound${suffix}`)
+  },
+  collectSouthbound: (code: string, fundScan = 'focus') =>
+    fetchApi(`/stock/${code}/southbound/collect?fund_scan=${fundScan}`, { method: 'POST' }),
 
   getAttribution: (code: string) => fetchApi(`/stock/${code}/attribution`),
   addAttribution: (code: string, data: any) =>

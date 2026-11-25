@@ -9,6 +9,7 @@ import IrTab from '../components/IrTab'
 import ReportsTab from '../components/ReportsTab'
 import CostAnalysisTab from '../components/CostAnalysisTab'
 import CapitalFlowTab from '../components/CapitalFlowTab'
+import SouthboundTab from '../components/SouthboundTab'
 
 interface Props {
   stockCode: string
@@ -17,7 +18,7 @@ interface Props {
   initialJobId?: string | null
 }
 
-type Tab = 'overview' | 'ccass' | 'trading' | 'signals' | 'reports' | 'ir' | 'cost' | 'flow'
+type Tab = 'overview' | 'ccass' | 'trading' | 'signals' | 'reports' | 'ir' | 'cost' | 'flow' | 'southbound'
 
 export default function StockDashboard({ stockCode, onBack, onStockUpdated, initialJobId }: Props) {
   const [dashboard, setDashboard] = useState<any>(null)
@@ -146,6 +147,7 @@ export default function StockDashboard({ stockCode, onBack, onStockUpdated, init
     { key: 'overview', label: t('tab_overview'), icon: '📊' },
     { key: 'ccass', label: t('tab_ccass'), icon: '🏦' },
     { key: 'flow', label: t('tab_flow'), icon: '🌊' },
+    { key: 'southbound', label: t('tab_southbound'), icon: '🧭' },
     { key: 'cost', label: t('tab_cost'), icon: '💰' },
     { key: 'trading', label: t('tab_trading'), icon: '📈' },
     { key: 'signals', label: t('tab_signals'), icon: '🚨' },
@@ -221,6 +223,8 @@ export default function StockDashboard({ stockCode, onBack, onStockUpdated, init
 
         {loading ? (
           <div className="text-center py-20 text-slate-400">{t('loading')}</div>
+        ) : tab === 'southbound' ? (
+          <SouthboundTab stockCode={code} />
         ) : !dashboard?.latest_ccass ? (
           <div className="text-center py-20">
             <p className="text-4xl mb-4">⏳</p>

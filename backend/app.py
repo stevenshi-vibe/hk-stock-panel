@@ -871,6 +871,58 @@ def get_capital_flow(stock_code: str, days: int = Query(5, ge=1, le=365), end_da
     return get_capital_flow(code, days=days, end_date=end_date)
 
 
+# ============ Southbound decomposition ============
+
+@app.post("/api/stock/{stock_code}/southbound/collect")
+def collect_southbound(stock_code: str, fund_scan: str = Query("focus", pattern="^(focus|sample|none)$")):
+    """后台采集南下合计、关注基金持仓和权益披露。不改原有 CCASS 抓取。"""
+    code = stock_code.zfill(5)
+    if not code.isdigit() or len(code) != 5:
+        raise HTTPException(400, "Invalid stock code")
+    ensure_stock(code)
+    job_id = uuid.uuid4().hex[:12]
+    _fetch_jobs[job_id] = {
+        'status': 'running', 'progress': 1, 'stage': 'southbound', 'code': code,
+    }
+
+    def _run():
+        try:
+            from services.southbound.service import collect_stock
+
+            def _on_progress(pct, stage):
+                job = _fetch_jobs.get(job_id)
+                if job and job.get('status') == 'running':
+                    job['progress'] = pct
+                    job['stage'] = stage
+
+            result = collect_stock(code, fund_scan=fund_scan, progress=_on_progress)
+            job = _fetch_jobs.get(job_id)
+            if job:
+                job.update({'status': 'done', 'progress': 100, 'stage': 'done', 'result': result})
+        except Exception as exc:
+            logger.exception("southbound collect failed")
+            job = _fetch_jobs.get(job_id)
+            if job:
+                job.update({'status': 'error', 'error': str(exc)})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {'job_id': job_id, 'stock_code': code}
+
+
+@app.get("/api/stock/{stock_code}/southbound")
+def get_southbound(
+    stock_code: str,
+    start: str = Query(None),
+    end: str = Query(None),
+):
+    """南下合计、已识别持仓、覆盖率和分析。没有采集过就返回空结构。"""
+    from services.southbound.service import build_view
+    code = stock_code.zfill(5)
+    if not code.isdigit() or len(code) != 5:
+        raise HTTPException(400, "Invalid stock code")
+    return build_view(code, start=start or None, end=end or None)
+
+
 # ============ Dashboard Summary ============
 
 @app.get("/api/stock/{stock_code}/dashboard")

@@ -387,3 +387,48 @@ def make_sina_client() -> AntiBanClient:
         timeout=10,
         extra_headers={"Referer": "https://finance.sina.com.cn/"},
     )
+
+
+def make_eastmoney_client() -> AntiBanClient:
+    """东方财富数据中心。当前接口没有商用授权，只作为可替换 provider 的一种实现。"""
+    return AntiBanClient(
+        min_interval=0.6,
+        max_retries=4,
+        timeout=25,
+        extra_headers={"Referer": "https://data.eastmoney.com/hsgt/"},
+    )
+
+
+def make_eastmoney_fund_client() -> AntiBanClient:
+    """天天基金持仓。Referer 由调用方按基金代码覆盖，缺了会 404。"""
+    return AntiBanClient(
+        min_interval=0.7,
+        max_retries=4,
+        timeout=25,
+        extra_headers={
+            "Referer": "https://fundf10.eastmoney.com/",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+
+
+def make_hkex_di_client() -> AntiBanClient:
+    """港交所权益披露日报。再分发前仍应核对站点条款。"""
+    return AntiBanClient(
+        min_interval=1.2,
+        max_retries=4,
+        timeout=30,
+        extra_headers={"Referer": "https://di.hkex.com.hk/"},
+    )
+
+
+def make_hkex_mutualmarket_client() -> AntiBanClient:
+    """港股通持股页与 CCASS 查询同一路径，条款限制个人非商业使用。默认只请求最近一个持股日。"""
+    return AntiBanClient(
+        min_interval=1.5,
+        max_retries=3,
+        timeout=30,
+        extra_headers={
+            "Referer": "https://www3.hkexnews.hk/sdw/search/mutualmarket.aspx?t=hk",
+        },
+    )
