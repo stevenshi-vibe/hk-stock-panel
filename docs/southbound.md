@@ -46,7 +46,7 @@
 
 - 日频合计：默认东财 `RPT_MUTUAL_STOCK_HOLDRANKS`。若设置 `SOUTHBOUND_LICENSED_CSV`，改为读 CSV，列是 `trade_date,stock_code,shares,pct_of_issued`，`shares` 必须已经是股。
 - 公募持仓：`parse_eastmoney_fund_html`。换成基金公司公告或持牌持仓文件时，产出同样的 `Holding`（`raw_unit=wan_shares` 或 `shares`）即可。
-- 权益披露：`parse_di_summary_html` 读港交所日报 HTML。大股东合并名单目前用 2026-11-25 的实测导出 `backend/fixtures/southbound/di_substantial_shareholders.csv`，只覆盖样例股票，不是持续接口。
+- 权益披露：`parse_di_summary_html` 读港交所日报 HTML。大股东合并名单如果放在本机 `backend/fixtures/southbound/di_substantial_shareholders.csv` 会被读入，但这个文件不进仓库。
 - 关注基金名单：`backend/fixtures/southbound/focus_funds.csv`，从基金简称里筛「港股通互联网 ETF」「恒生科技 ETF」以及附件里扫到的 QDII/沪港深样本。全市场约 2.8 万只基金不会在默认采集里扫完。
 
 ## 合规

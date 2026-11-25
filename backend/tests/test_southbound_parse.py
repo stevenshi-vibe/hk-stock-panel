@@ -1,6 +1,7 @@
-"""解析真实样例：万股、权益披露好仓/淡仓、官方合计与东财百分比。"""
+"""解析测试。夹具是合成的：虚构代码、虚构名称、虚构数字，不是上游抓取结果。"""
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -8,9 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from services.southbound.classify import classify_disclosure, classify_fund
 from services.southbound.models import CONFIRMED, NON_CONNECT, POSSIBLE
 from services.southbound.parse import (
-    load_focus_catalog,
     mutualmarket_code,
-    parse_akshare_daily_csv,
     parse_di_roster_csv,
     parse_di_summary_html,
     parse_eastmoney_daily_row,
@@ -23,160 +22,200 @@ from services.southbound.parse import (
 )
 from services.southbound.units import assess_unit, wan_to_shares
 
-FIX = os.path.join(os.path.dirname(__file__), "..", "fixtures", "southbound")
+# 结构对齐天天基金档案页，内容全部虚构。
+SYNTHETIC_FUND_JS = (
+    'var apidata={ content:"<div class=\'box\'><h4 class=\'t\'>合成港股通样本ETF 2026年3季度股票投资明细</h4>'
+    '<font class=\'px12\'>2026-09-30</font><table><thead><tr>'
+    '<th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th>'
+    '<th>持股数（万股）</th><th>持仓市值（万元）</th></tr></thead><tbody><tr>'
+    '<td>1</td><td>99001</td><td>合成港股甲</td><td>12.50%</td>'
+    '<td>1,234.50</td><td>61,725.00</td></tr></tbody></table></div>",arryear:[2026],curyear:2026};'
+)
+
+SYNTHETIC_DI_HTML = """
+<table><tr>
+<td>CS20260101E00001</td>
+<td>合成公司</td>
+<td>99001</td>
+<td>Ordinary Shares</td>
+<td>合成外资样本公司</td>
+<td>01/01/2026</td>
+<td>1205(L)</td>
+<td>1,000(L)</td>
+<td></td>
+<td>旧余额</td>
+<td><table><tr><td>200,000(L)</td><td>5.50</td></tr><tr><td>1,000(S)</td><td>0.10</td></tr></table></td>
+</tr></table>
+"""
+
+SYNTHETIC_MUTUAL = """
+<h2><span>Shareholding Date: 2026/09/30</span></h2>
+<table><tr>
+<td class="col-stock-code"><div class="mobile-list-heading">Stock Code:</div><div class="mobile-list-body">99001</div></td>
+<td class="col-stock-name"><div class="mobile-list-body">SYNTHETIC CO</div></td>
+<td class="col-shareholding"><div class="mobile-list-heading">Shareholding in CCASS:</div><div class="mobile-list-body">1,000,000</div></td>
+<td class="col-shareholding-percent"><div class="mobile-list-body">10.00%</div></td>
+</tr></table>
+"""
 
 
 class UnitTests(unittest.TestCase):
-    def test_wan_shares_from_real_meituan_line(self):
-        # 港股通互联网ETF富国 2026Q3 美团：5,018.57 万股。
-        self.assertEqual(wan_to_shares(5018.57), 50_185_700)
+    def test_wan_to_shares(self):
+        self.assertEqual(wan_to_shares(1234.50), 12_345_000)
 
-    def test_declared_wan_matches_market_value(self):
-        # 市值 308,892.98 万元 / 5,018.57 万股 ≈ 61.55 元，单位声明正确。
-        self.assertEqual(assess_unit(5018.57, "wan_shares", 308892.98), "ok")
+    def test_price_confirms_wan_unit(self):
+        # 61,725 万元 / 1,234.50 万股 = 50 元。
+        self.assertEqual(assess_unit(1234.50, "wan_shares", 61725), "ok")
 
-    def test_forgetting_wan_conversion_is_rejected(self):
-        # 若把 5018.57 当成股，隐含价格会到几十万，必须剔除。
-        self.assertEqual(assess_unit(5018.57, "shares", 308892.98), "mismatch")
+    def test_unconverted_shares_are_rejected(self):
+        self.assertEqual(assess_unit(1234.50, "shares", 61725), "mismatch")
 
 
 class PositionTests(unittest.TestCase):
-    def test_balance_does_not_swallow_next_lot(self):
-        tokens = parse_position_tokens("336,749,593(L) 1,024,500(S)")
+    def test_next_lot_is_not_eaten_as_percent(self):
+        tokens = parse_position_tokens("200,000(L) 1,000(S)")
         self.assertEqual(
             [(item["position"], item["shares"]) for item in tokens],
-            [("L", 336_749_593), ("S", 1_024_500)],
+            [("L", 200_000), ("S", 1_000)],
         )
         self.assertIsNone(tokens[0]["pct"])
 
-    def test_balance_keeps_percent_between_lots(self):
-        tokens = parse_position_tokens("326,833,563(L) 5.84 642,000(S) 0.01")
-        self.assertEqual(tokens[0]["pct"], 5.84)
-        self.assertEqual(tokens[1]["shares"], 642_000)
-        self.assertEqual(tokens[1]["pct"], 0.01)
+    def test_percent_between_lots(self):
+        tokens = parse_position_tokens("200,000(L) 5.50 1,000(S) 0.10")
+        self.assertEqual(tokens[0]["pct"], 5.50)
+        self.assertEqual(tokens[1]["shares"], 1_000)
 
 
 class FundParseTests(unittest.TestCase):
-    def test_live_archive_html_for_159792(self):
-        text = open(os.path.join(FIX, "fund_159792_2026.js"), encoding="utf-8").read()
+    def test_synthetic_archive(self):
         rows = parse_eastmoney_fund_html(
-            text,
-            fund_code="159792",
-            fund_name="港股通互联网ETF富国",
+            SYNTHETIC_FUND_JS,
+            fund_code="990001",
+            fund_name="合成港股通样本ETF",
             fund_type="指数型-股票",
-            stock_code="03690",
+            stock_code="99001",
         )
-        q3 = next(row for row in rows if row.report_date == "2026-09-30")
-        self.assertEqual(q3.shares, 50_185_700)
-        self.assertEqual(q3.raw_unit, "wan_shares")
-        self.assertEqual(q3.channel_tag, CONFIRMED)
-        self.assertTrue(q3.counts_toward_southbound)
-        self.assertEqual(q3.unit_status, "ok")
-        self.assertEqual(q3.report_scope, "top10")
-        self.assertAlmostEqual(q3.pct_nav, 9.32)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.shares, 12_345_000)
+        self.assertIn("99001", row.notes)
+        self.assertEqual(row.report_date, "2026-09-30")
+        self.assertEqual(row.channel_tag, CONFIRMED)
+        self.assertTrue(row.counts_toward_southbound)
+        self.assertEqual(row.unit_status, "ok")
+        self.assertEqual(row.report_scope, "top10")
 
-    def test_hits_csv_classifies_qdii_and_huhangshen(self):
-        catalog = load_focus_catalog(os.path.join(FIX, "focus_funds.csv"))
-        rows = [
-            row for row in parse_fund_hits_csv(os.path.join(FIX, "fund_holdings_hits_01810_03690.csv"), catalog)
-            if row.report_date == "2026-09-30" and row.holder_key.endswith("03690") or (
-                row.report_date == "2026-09-30" and "03690" in row.notes
-            )
-        ]
-        by_key = {}
-        for row in parse_fund_hits_csv(os.path.join(FIX, "fund_holdings_hits_01810_03690.csv"), catalog):
-            if row.report_date == "2026-09-30" and "03690" in (row.notes or ""):
-                by_key[row.holder_key] = row
-        self.assertEqual(by_key["fund:159792"].channel_tag, CONFIRMED)
-        self.assertEqual(by_key["fund:513180"].channel_tag, NON_CONNECT)
-        self.assertFalse(by_key["fund:513180"].counts_toward_southbound)
-        q4 = [
-            row for row in parse_fund_hits_csv(os.path.join(FIX, "fund_holdings_hits_01810_03690.csv"), catalog)
-            if row.holder_key == "fund:000041" and row.report_date == "2025-12-31" and "03690" in row.notes
-        ]
-        self.assertEqual(q4[0].channel_tag, NON_CONNECT)
+    def test_hits_csv_channels(self):
+        content = (
+            "基金代码,基金名称,查询年份,序号,股票代码,股票名称,占净值比例,持股数,持仓市值,季度\n"
+            "990001,合成港股通样本ETF,2026,1,99001,合成港股甲,12.5,1234.50,61725.00,2026年3季度股票投资明细\n"
+            "990002,合成全球股票(QDII),2026,2,99001,合成港股甲,1.0,10.00,500.00,2026年3季度股票投资明细\n"
+            "990004,合成沪港深样本,2026,3,99001,合成港股甲,2.0,20.00,1000.00,2026年3季度股票投资明细\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as handle:
+            handle.write(content)
+            path = handle.name
+        catalog = {
+            "990002": {"fund_type": "QDII-普通股票"},
+            "990004": {"fund_type": "混合型"},
+        }
+        rows = {
+            row.holder_key: row
+            for row in parse_fund_hits_csv(path, catalog)
+            if "99001" in (row.notes or "")
+        }
+        self.assertEqual(rows["fund:990001"].channel_tag, CONFIRMED)
+        self.assertEqual(rows["fund:990001"].shares, 12_345_000)
+        self.assertEqual(rows["fund:990002"].channel_tag, NON_CONNECT)
+        self.assertFalse(rows["fund:990002"].counts_toward_southbound)
+        self.assertEqual(rows["fund:990004"].channel_tag, POSSIBLE)
 
 
-class DisclosureParseTests(unittest.TestCase):
-    def test_daily_summary_row_splits_long_and_short(self):
-        html = open(os.path.join(FIX, "di_dsm_03690_row.html"), encoding="utf-8").read()
-        rows = parse_di_summary_html(html, stock_code="03690", summary_date="2026-11-17")
+class DisclosureAndDailyTests(unittest.TestCase):
+    def test_di_html_splits_long_and_short(self):
+        rows = parse_di_summary_html(SYNTHETIC_DI_HTML, stock_code="99001", summary_date="2026-01-02")
         by_pos = {row.position_type: row for row in rows}
-        self.assertEqual(by_pos["L"].shares, 326_833_563)
-        self.assertEqual(by_pos["S"].shares, 642_000)
-        self.assertEqual(by_pos["L"].report_date, "2026-11-12")
+        self.assertEqual(by_pos["L"].shares, 200_000)
+        self.assertEqual(by_pos["S"].shares, 1_000)
+        self.assertEqual(by_pos["L"].report_date, "2026-01-01")
         self.assertEqual(by_pos["L"].channel_tag, NON_CONNECT)
         self.assertFalse(by_pos["L"].counts_toward_southbound)
-        self.assertEqual(by_pos["L"].source_ref, "CS20261117E00012")
 
-    def test_roster_uses_consolidated_list(self):
-        rows = parse_di_roster_csv(os.path.join(FIX, "di_substantial_shareholders.csv"), "03690")
-        blackrock = [row for row in rows if "BlackRock" in row.holder_name and row.position_type == "L"]
-        self.assertEqual(len(blackrock), 1)
-        self.assertEqual(blackrock[0].shares, 336_749_593)
-        self.assertAlmostEqual(blackrock[0].pct_issued, 6.02)
-        self.assertEqual(blackrock[0].report_date, "2026-11-18")
-        self.assertTrue(all(row.channel_tag == NON_CONNECT for row in rows))
-        self.assertTrue(all(not row.counts_toward_southbound for row in rows))
+    def test_roster_prefers_consolidated_and_does_not_sum(self):
+        content = (
+            "stock_code,report,form_serial,shareholder,shares_interested,pct_issued_voting,last_notice_date,form_href\n"
+            "99001,complete_ss,CS20260101E00099,合成外资样本公司,\"9,999(L)\",1.00(L),01/01/2026,\n"
+            "99001,consolidated_ss,CS20260101E00001,合成外资样本公司,\"200,000(L) 1,000(S)\",\"5.50(L) 0.10(S)\",01/01/2026,\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as handle:
+            handle.write(content)
+            path = handle.name
+        rows = parse_di_roster_csv(path, "99001")
+        long_rows = [row for row in rows if row.position_type == "L"]
+        short_rows = [row for row in rows if row.position_type == "S"]
+        self.assertEqual(len(long_rows), 1)
+        self.assertEqual(long_rows[0].shares, 200_000)
+        self.assertEqual(long_rows[0].source_ref, "CS20260101E00001")
+        self.assertEqual(short_rows[0].shares, 1_000)
+        self.assertNotEqual(long_rows[0].shares + short_rows[0].shares, 9_999)
 
+    def test_daily_ratio_choice(self):
+        point = parse_eastmoney_daily_row({
+            "TRADE_DATE": "2026-09-30 00:00:00",
+            "HOLD_SHARES": 1_000_000,
+            "HOLD_SHARES_RATIO": 10.0,
+            "TOTAL_SHARES_RATIO": 99.0,
+            "CLOSE_PRICE": 10,
+            "CHANGE_RATE": 1.2,
+            "HOLD_MARKET_CAP": 10_000_000,
+        })
+        self.assertEqual(point.shares, 1_000_000)
+        self.assertEqual(point.pct_of_issued, 10.0)
+        self.assertNotEqual(point.pct_of_issued, 99.0)
 
-class DailyParseTests(unittest.TestCase):
-    def test_eastmoney_uses_hold_ratio_not_total_ratio(self):
-        import json
-        row = json.load(open(os.path.join(FIX, "eastmoney_daily_03690_20261124.json"), encoding="utf-8"))
-        point = parse_eastmoney_daily_row(row)
-        self.assertEqual(point.trade_date, "2026-11-24")
-        self.assertEqual(point.shares, 1_200_236_536)
-        self.assertEqual(point.pct_of_issued, 19.43)
-        self.assertNotEqual(point.pct_of_issued, row["TOTAL_SHARES_RATIO"])
-
-    def test_akshare_csv_last_row_matches_official(self):
-        points = parse_akshare_daily_csv(os.path.join(FIX, "hsgt_individual_03690.csv"))
-        last = points[-1]
-        self.assertEqual(last.trade_date, "2026-11-24")
-        self.assertEqual(last.shares, 1_200_236_536)
-        self.assertEqual(last.pct_of_issued, 19.43)
-        self.assertEqual(points[1].share_change, points[1].shares - points[0].shares)
-
-    def test_mutualmarket_snippet(self):
-        html = open(os.path.join(FIX, "mutualmarket_03690_snippet.html"), encoding="utf-8").read()
-        points = parse_mutualmarket_html(html)
+    def test_mutualmarket_reads_value_not_heading(self):
+        points = parse_mutualmarket_html(SYNTHETIC_MUTUAL)
         self.assertEqual(len(points), 1)
-        self.assertEqual(mutualmarket_code(points[0]), "03690")
-        self.assertEqual(points[0].shares, 1_200_236_536)
-        self.assertEqual(points[0].pct_of_issued, 19.43)
-        self.assertEqual(points[0].trade_date, "2026-11-24")
+        self.assertEqual(mutualmarket_code(points[0]), "99001")
+        self.assertEqual(points[0].shares, 1_000_000)
+        self.assertEqual(points[0].pct_of_issued, 10.0)
+        self.assertEqual(points[0].trade_date, "2026-09-30")
 
-    def test_seat_json_sums_to_total(self):
-        import json
-        rows = json.load(open(os.path.join(FIX, "eastmoney_seats_03690_20261124.json"), encoding="utf-8"))
-        seats = [parse_eastmoney_seat_row(row) for row in rows]
-        self.assertEqual(sum(seat.shares for seat in seats), 1_200_236_536)
-        self.assertEqual({seat.participant_id for seat in seats}, {"A00003", "A00004"})
+    def test_seats_sum(self):
+        seats = [
+            parse_eastmoney_seat_row({
+                "HOLD_DATE": "2026-09-30", "HOLD_NUM": 400_000,
+                "PARTICIPANT_CODE": "A00003", "ORG_NAME": "合成沪",
+            }),
+            parse_eastmoney_seat_row({
+                "HOLD_DATE": "2026-09-30", "HOLD_NUM": 600_000,
+                "PARTICIPANT_CODE": "A00004", "ORG_NAME": "合成深",
+            }),
+        ]
+        self.assertEqual(sum(seat.shares for seat in seats), 1_000_000)
+
+    def test_licensed_csv(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as handle:
+            handle.write(
+                "trade_date,stock_code,shares,pct_of_issued\n"
+                "2026-09-30,99001,1000000,10\n"
+                "2026-09-30,99002,5,1\n"
+            )
+            path = handle.name
+        points = parse_licensed_csv(path, "99001")
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0].shares, 1_000_000)
+        self.assertEqual(points[0].provider_id, "hkex_licensed_csv")
 
 
 class ClassifyTests(unittest.TestCase):
     def test_channels(self):
-        self.assertEqual(classify_fund("港股通互联网ETF富国", "指数型-股票")[0], CONFIRMED)
-        self.assertEqual(classify_fund("华夏全球股票(QDII)(人民币)", "QDII-普通股票")[0], NON_CONNECT)
-        self.assertEqual(classify_fund("恒生科技ETF华夏", "指数型-海外股票")[0], NON_CONNECT)
-        self.assertEqual(classify_fund("前海开源沪港深蓝筹精选混合A", "混合型")[0], POSSIBLE)
-        self.assertEqual(classify_disclosure("BlackRock, Inc.")[0], NON_CONNECT)
-        self.assertEqual(classify_disclosure("中国人寿保险股份有限公司")[0], POSSIBLE)
-
-
-class LicensedCsvTests(unittest.TestCase):
-    def test_filters_stock_and_keeps_shares(self):
-        import tempfile
-        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as handle:
-            handle.write("trade_date,stock_code,shares,pct_of_issued\n")
-            handle.write("2026-11-24,03690,1200236536,19.43\n")
-            handle.write("2026-11-24,01810,4761661531,18.49\n")
-            path = handle.name
-        points = parse_licensed_csv(path, "03690")
-        self.assertEqual(len(points), 1)
-        self.assertEqual(points[0].shares, 1_200_236_536)
-        self.assertEqual(points[0].provider_id, "hkex_licensed_csv")
+        self.assertEqual(classify_fund("合成港股通样本ETF", "指数型-股票")[0], CONFIRMED)
+        self.assertEqual(classify_fund("合成全球股票(QDII)", "QDII-普通股票")[0], NON_CONNECT)
+        self.assertEqual(classify_fund("合成恒生样本ETF", "指数型-海外股票")[0], NON_CONNECT)
+        self.assertEqual(classify_fund("合成沪港深样本", "混合型")[0], POSSIBLE)
+        self.assertEqual(classify_disclosure("合成外资样本公司")[0], NON_CONNECT)
+        self.assertEqual(classify_disclosure("中国人寿合成样本")[0], POSSIBLE)
 
 
 if __name__ == "__main__":

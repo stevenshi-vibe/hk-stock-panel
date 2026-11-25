@@ -1,6 +1,9 @@
-# User-specific stock data
-data/*.db
+# User-specific stock data and southbound index / upstream caches.
+# 不要提交个股库、南下索引，或以后误放到这里的抓取结果。
+data/**
 !data/.gitkeep
+backend/fixtures/southbound/raw/
+backend/fixtures/southbound/cache/
 uploads/*
 !uploads/.gitkeep
 
