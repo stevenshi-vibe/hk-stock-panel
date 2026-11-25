@@ -15,7 +15,7 @@ UPLOAD_DIR = os.path.join(os.path.dirname(__file__), '..', 'uploads')
 # Global meta DB (tracks which stocks are being monitored, user-uploaded files, etc.)
 META_DB_PATH = os.path.join(DATA_DIR, '_meta.db')
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _migrate_stock_db(conn):
@@ -78,6 +78,10 @@ def _migrate_stock_db(conn):
 
         if 'schema_version' in existing_tables or 'schema_version' in needed_tables:
             conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+
+        # 南下拆解表。旧库走这里补表，不改已有表的读写。
+        from services.southbound.store import ensure_tables
+        ensure_tables(conn)
     except sqlite3.OperationalError:
         pass
 
